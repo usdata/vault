@@ -2,15 +2,17 @@
 """
 Scan a HashiCorp Vault Enterprise cluster (tested target: 1.19.8) for KV
 secrets that contain at least one data field key matching the pattern
-"m12345" followed by zero or more additional digits.
+"m" followed by any 5 digits (0-9).
 
 Matches (field-key NAMES, same as vault_svc_scan.py):
     m12345          -> yes
-    m123456         -> yes  (extra digits after the 5-digit number)
-    m1234567890     -> yes
-    m12345-foo      -> no   (default pattern only allows trailing DIGITS)
-    svc-m12345      -> no   (must START with m12345)
-    m1234           -> no   (needs the full 5-digit "12345")
+    m98765          -> yes  (any 5 digits, not just 12345)
+    m00000          -> yes
+    m123456         -> yes  (extra characters after the 5 digits are allowed)
+    m12345-prod     -> yes
+    svc-m12345      -> no   (must START with m)
+    m1234           -> no   (needs at least 5 digits after the m)
+    mabcde          -> no   (the 5 chars after m must be digits)
 Override the default with --pattern if you need different rules.
 
 It walks EVERY namespace (recursively, including nested children), discovers
@@ -51,11 +53,13 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 VAULT_ADDR = os.environ.get("VAULT_ADDR", "").rstrip("/")
 VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "")
 
-# Default regex: a field key that STARTS with "m12345" and is then followed by
-# zero or more additional digits (and nothing else). The trailing $ keeps it
-# from matching e.g. "m12345_user"; drop it via --pattern if you want looser
-# matching.
-DEFAULT_PATTERN = r"^m12345\d*$"
+# Default regex: a field key that STARTS with "m" followed by ANY 5 digits
+# (0-9) -- e.g. m12345, m98765, m00000. \d{5} means exactly five digits; the
+# match is a PREFIX match (re.search anchored with ^), so anything after the
+# 5 digits is still allowed (more digits, "-prod", "_password", etc.).
+# Pass --pattern r'^m\d{5}$' if you want EXACTLY m + 5 digits and nothing else,
+# or r'^m\d{5}\d*$' for "m + 5-or-more digits, nothing else".
+DEFAULT_PATTERN = r"^m\d{5}"
 
 # How many seconds to wait on each API call.
 TIMEOUT = 30
@@ -214,6 +218,12 @@ def main():
                     help=r"regex the field-key name must match (default: %s)" % DEFAULT_PATTERN)
     ap.add_argument("--ignore-case", action="store_true",
                     help="match the pattern case-insensitively (e.g. also M12345)")
+    ap.add_argument("--match", choices=["key", "name", "both"], default="both",
+                    help="match the secret's leaf NAME, its field KEYs, or BOTH "
+                         "(default: both). 'name' is for secrets literally named m12345*.")
+    ap.add_argument("--show-all", action="store_true",
+                    help="debug: log every secret path and its field-key names, "
+                         "whether or not it matches. Use to see what's actually there.")
     ap.add_argument("--ns", default="", help="starting namespace (default: root)")
     ap.add_argument("--workers", type=int, default=16, help="concurrent API workers (default: 16)")
     ap.add_argument("--insecure", action="store_true", help="skip TLS certificate verification")
@@ -236,8 +246,9 @@ def main():
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
 
-    log("Matching field keys against regex: %s%s"
-        % (args.pattern, " (case-insensitive)" if args.ignore_case else ""))
+    log("Matching %s against regex: %s%s"
+        % ({"key": "field keys", "name": "secret names", "both": "secret names + field keys"}[args.match],
+           args.pattern, " (case-insensitive)" if args.ignore_case else ""))
 
     # --- Phase 1: enumerate namespaces (parallel BFS, one call per ns) -------
     log("Phase 1: enumerating namespaces (parallel BFS, %d workers)..." % args.workers)
@@ -272,16 +283,37 @@ def main():
         return list_dir(mount, version, ns, rel, ssl_ctx)
 
     def do_read(ns, mount, version, rel):
-        fields = read_secret(mount, version, rel, ns, ssl_ctx)
-        with counter_lock:
-            counter["secrets"] += 1
-        matched = sorted(k for k in fields if key_re.search(k))
-        if matched:
+        # Does the secret's own leaf name match? (e.g. a secret named "m12345")
+        leaf = rel.rstrip("/").rsplit("/", 1)[-1]
+        name_hit = key_re.search(leaf) if args.match in ("name", "both") else None
+
+        # Only read the secret body when we actually need to inspect field keys.
+        matched_keys = []
+        if args.match in ("key", "both") or args.show_all:
+            fields = read_secret(mount, version, rel, ns, ssl_ctx)
+            with counter_lock:
+                counter["secrets"] += 1
+            matched_keys = sorted(k for k in fields if key_re.search(k))
+            if args.show_all:
+                ns_label = ns if ns else "root"
+                log("  SEEN %s -> %s%s  leaf=%r  keys=%r"
+                    % (ns_label, mount, rel, leaf, sorted(fields.keys())))
+        else:
+            # name-only mode: we already have the leaf from the listing, no read.
+            with counter_lock:
+                counter["secrets"] += 1
+            if args.show_all:
+                ns_label = ns if ns else "root"
+                log("  SEEN %s -> %s%s  leaf=%r" % (ns_label, mount, rel, leaf))
+
+        if name_hit or matched_keys:
             ns_label = ns if ns else "root"
             full_path = mount + rel  # e.g. "app1/kv/m12345"
+            matched_name = leaf if name_hit else ""
             with rows_lock:
-                rows.append((ns_label, full_path, ";".join(matched)))
-            log("  MATCH %s -> %s (%s)" % (ns_label, full_path, ",".join(matched)))
+                rows.append((ns_label, full_path, matched_name, ";".join(matched_keys)))
+            log("  MATCH %s -> %s  name=%s keys=%s"
+                % (ns_label, full_path, matched_name or "-", ",".join(matched_keys) or "-"))
 
     log("Phase 3: walking trees + reading secrets with %d workers..." % args.workers)
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -317,7 +349,7 @@ def main():
 
     with open(args.output, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["namespace", "kv_path", "matched_keys"])
+        w.writerow(["namespace", "kv_path", "matched_name", "matched_keys"])
         w.writerows(rows)
 
     sys.stderr.write(
