@@ -1,0 +1,24 @@
+We had a productive discussion with several attendees, including Dave Randolph (IBM), Rocky Mills, Sean Kelly, and Prudhvi.
+
+The primary focus of the meeting was reviewing the available options for applications to authenticate and retrieve secrets from HashiCorp Vault. Dave provided a detailed overview of Vault's Certificate Authentication (Cert Auth) method and explained how it can be secured using CIDR/IP range restrictions. These controls allow access to be limited to approved systems and networks. Once authenticated, applications can use Vault-issued tokens to securely access secrets stored within Vault.
+
+Prudhvi described a challenge with several applications that use large property files containing hundreds of configuration entries. Many of these files currently contain sensitive information such as usernames, passwords, and other confidential parameters. Security scanning tools, including Veracode, have flagged these values and recommended removing them from source code repositories and GitHub. The team discussed using Vault as the centralized solution for securely storing and managing these sensitive values.
+
+Sean also mentioned that some applications require database credentials that are expected to remain static. Based on the current requirements, the KV Secrets Engine appears to be the most appropriate Vault solution for storing these credentials. The discussion focused on using KV for secret storage while leveraging Certificate Authentication for secure application access.
+
+Additional security controls available through Cert Auth were reviewed, including:
+
+CIDR/IP range restrictions to limit where authentication requests can originate.
+Certificate validation and Common Name (CN) restrictions to further narrow access to authorized applications and systems.
+Token-based access after successful authentication, allowing applications to securely retrieve secrets.
+
+Prashant previously created a Vault namespace for Prudhvi's team. During the discussion, it was noted that Prudhvi's team may need assistance configuring Certificate Authentication. I offered to work with them and provide guidance as needed during the implementation.
+
+Toward the end of the meeting, we discussed Vault team responsibilities going forward:
+
+Muhammad Khan and Mike will focus on Vault architecture and design.
+Prashant will primarily support Vault operations.
+Paul will work closely with the architecture team.
+The four of us will continue collaborating on HashiCorp Vault initiatives within 
+
+As a next step, Sean, Prudhvi, and Rocky will meet internally to determine the best integration approach for their applications and assess any application-side changes that may be required. The team agreed to bring any additional questions or design considerations to future meetings.
